@@ -140,7 +140,19 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_del_confirm, pattern="^delconfirm:"))
     app.add_handler(CallbackQueryHandler(cb_del_cancel, pattern="^delcancel$"))
 
-    asyncio.run(app.run_polling())
-
+   # ==========================================
+# 修复 Render + Python 3.14 事件循环报错
+# ==========================================
 if __name__ == "__main__":
-    main()
+    import asyncio
+    from telegram.ext import ApplicationBuilder
+
+    # 重建事件循环，解决 Render 启动崩溃
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    loop.run_until_complete(app.run_polling())
