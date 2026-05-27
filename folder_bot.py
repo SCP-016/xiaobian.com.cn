@@ -17,6 +17,7 @@ Telegram 文件夹式视频管理机器人（优化版 + 删除视频功能）
 
 import logging
 import os
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -475,7 +476,7 @@ async def cb_save_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════
-# 启动
+# 启动（已修复异步错误）
 # ══════════════════════════════════════════
 async def post_init(app):
     await init_db()
@@ -506,7 +507,6 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_del_confirm, pattern="^delconfirm:"))
     app.add_handler(CallbackQueryHandler(cb_del_cancel, pattern="^delcancel$"))
 
-     import asyncio
     asyncio.run(app.run_polling())
 
 if __name__ == "__main__":
