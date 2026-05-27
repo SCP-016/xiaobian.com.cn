@@ -1,22 +1,18 @@
 """
-Telegram 文件夹式视频管理机器人
+Telegram 文件夹式视频管理机器人（优化版 + 删除视频功能）
 ================================
 命令：
     /start / /help     使用说明
-    /newfolder         创建新文件夹（Bot 会询问名称）
+    /newfolder         创建新文件夹
     /folders           查看所有文件夹
-    /open <文件夹名>   选择当前文件夹，之后转发的视频自动存入
-    /get  <文件夹名>   取出该文件夹内所有视频
+    /open <文件夹名>   选择当前文件夹
+    /get  <文件夹名>   取出该文件夹所有视频
+    /list <文件夹名>   查看文件夹内视频列表（带编号）
+    /delVideo <文件夹名> <视频编号>  删除单个视频
     /rename <旧名> <新名>  重命名文件夹
-    /delFolder <文件夹名>  删除文件夹及其所有视频
+    /delFolder <文件夹名>  删除文件夹
 
-    转发视频时：
-        • 若已用 /open 选择了文件夹 → 直接存入
-        • 若未选择 → Bot 显示文件夹列表供你选择
-
-环境变量（Railway Variables）：
-    BOT_TOKEN       Telegram Bot Token（必填）
-    DATABASE_URL    Railway PostgreSQL 连接串（必填，自动注入）
+视频仅保存 file_id，不占用服务器存储空间！
 """
 
 import logging
@@ -39,21 +35,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# ConversationHandler 状态
 ASK_FOLDER_NAME = 1
-ASK_WHICH_FOLDER = 2
 
 
 # ══════════════════════════════════════════
 #  数据库
 # ══════════════════════════════════════════
-
 async def get_db():
     return await asyncpg.connect(DATABASE_URL)
-
 
 async def init_db():
     conn = await get_db()
@@ -78,12 +70,10 @@ async def init_db():
                 added_at     TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        logger.info("数据库初始化完成")
+        logger.info("✅ 数据库初始化完成")
     finally:
         await conn.close()
 
-
-# ── 文件夹 CRUD ──
 
 async def db_create_folder(owner_id: int, name: str) -> bool:
     conn = await get_db()
@@ -104,8 +94,7 @@ async def db_list_folders(owner_id: int):
     try:
         return await conn.fetch(
             """
-            SELECT f.id, f.name,
-                   COUNT(v.id) AS video_count
+            SELECT f.id, f.name, COUNT(v.id) AS video_count
             FROM folders f
             LEFT JOIN videos v ON v.folder_id = f.id
             WHERE f.owner_id = $1
@@ -162,8 +151,6 @@ async def db_delete_folder(owner_id: int, name: str) -> bool:
         await conn.close()
 
 
-# ── 视频 CRUD ──
-
 async def db_add_video(folder_id: int, file_id: str, file_name: str,
                        caption: str, forward_from: str):
     conn = await get_db()
@@ -191,11 +178,28 @@ async def db_get_videos(folder_id: int):
 
 
 # ══════════════════════════════════════════
-#  工具函数
+# 【新增】删除单个视频
 # ══════════════════════════════════════════
+async def db_delete_video(folder_id: int, video_index: int):
+    conn = await get_db()
+    try:
+        videos = await conn.fetch(
+            "SELECT id FROM videos WHERE folder_id=$1 ORDER BY added_at",
+            folder_id,
+        )
+        if 1 <= video_index <= len(videos):
+            video_id = videos[video_index - 1]["id"]
+            await conn.execute("DELETE FROM videos WHERE id=$1", video_id)
+            return True
+        return False
+    finally:
+        await conn.close()
 
+
+# ══════════════════════════════════════════
+# 工具
+# ══════════════════════════════════════════
 def get_forward_source(message) -> str | None:
-    """提取转发来源名称"""
     if message.forward_origin:
         origin = message.forward_origin
         t = getattr(origin, "type", None)
@@ -205,7 +209,7 @@ def get_forward_source(message) -> str | None:
         elif t == "user":
             u = getattr(origin, "sender_user", None)
             if u:
-                return f"{u.first_name or ''} {u.last_name or ''}".strip()
+                return f"{u.first_name} {u.last_name}".strip()
         elif t == "hidden_user":
             return getattr(origin, "sender_user_name", "匿名用户")
         elif t == "chat":
@@ -213,415 +217,296 @@ def get_forward_source(message) -> str | None:
             return getattr(chat, "title", None) or getattr(chat, "username", None)
     if message.forward_from:
         u = message.forward_from
-        return f"{u.first_name or ''} {u.last_name or ''}".strip()
+        return f"{u.first_name} {u.last_name}".strip()
     if message.forward_from_chat:
-        return message.forward_from_chat.title or message.forward_from_chat.username
+        return message.forward_from_chat.title
     return None
 
 
 async def build_folder_keyboard(owner_id: int, callback_prefix: str):
-    """生成文件夹选择按钮"""
     rows = await db_list_folders(owner_id)
     if not rows:
         return None
-    buttons = [
-        [InlineKeyboardButton(
-            f"📁 {r['name']}  ({r['video_count']} 个视频)",
-            callback_data=f"{callback_prefix}:{r['name']}"
-        )]
-        for r in rows
-    ]
+    buttons = []
+    for r in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                f"📁 {r['name']} ({r['video_count']}个)",
+                callback_data=f"{callback_prefix}:{r['name']}"
+            )
+        ])
     return InlineKeyboardMarkup(buttons)
 
 
 # ══════════════════════════════════════════
-#  /start  /help
+# 帮助
 # ══════════════════════════════════════════
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📁 *视频文件夹机器人*\n\n"
-        "🆕 `/newfolder` — 创建新文件夹\n"
+        "📁 *视频文件夹机器人（优化版）*\n\n"
+        "🆕 `/newfolder` — 创建文件夹\n"
         "📋 `/folders` — 查看所有文件夹\n"
-        "📂 `/open 文件夹名` — 选择当前文件夹\n"
-        "   之后转发的视频自动存入该文件夹\n"
-        "📤 `/get 文件夹名` — 取出文件夹内所有视频\n"
-        "✏️ `/rename 旧名 新名` — 重命名文件夹\n"
-        "🗑 `/delFolder 文件夹名` — 删除文件夹及视频\n\n"
-        "💡 *转发视频时*：\n"
-        "• 若已 `/open` 选了文件夹 → 直接存入\n"
-        "• 若未选 → Bot 会弹出文件夹列表让你选",
+        "📂 `/open 名称` — 选定文件夹（自动存入）\n"
+        "📜 `/list 名称` — 查看视频列表\n"
+        "📤 `/get 名称` — 获取所有视频\n"
+        "🗑 `/delVideo 文件夹 编号` — 删除单个视频\n"
+        "✏️ `/rename 旧名 新名` — 重命名\n"
+        "🗑 `/delFolder 名称` — 删除文件夹\n",
         parse_mode="Markdown",
     )
 
 
 # ══════════════════════════════════════════
-#  /newfolder — 创建文件夹（对话流程）
+# 新建文件夹
 # ══════════════════════════════════════════
-
 async def cmd_newfolder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📁 请输入新文件夹的名称：\n"
-        "（发送 /cancel 取消）"
-    )
+    await update.message.reply_text("📁 输入文件夹名称：")
     return ASK_FOLDER_NAME
-
 
 async def receive_folder_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("名称不能为空，请重新输入：")
+        await update.message.reply_text("❌ 名称不能为空")
         return ASK_FOLDER_NAME
-
-    owner_id = update.effective_user.id
-    ok = await db_create_folder(owner_id, name)
+    ok = await db_create_folder(update.effective_user.id, name)
     if ok:
-        await update.message.reply_text(
-            f"✅ 文件夹 *{name}* 已创建！\n\n"
-            f"用 `/open {name}` 选择它，之后转发视频会自动存入。",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"✅ 创建成功：{name}")
     else:
-        await update.message.reply_text(
-            f"⚠️ 文件夹 *{name}* 已存在，请换个名称：",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("⚠️ 已存在同名文件夹")
         return ASK_FOLDER_NAME
-
     return ConversationHandler.END
-
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("已取消。")
+    await update.message.reply_text("✅ 已取消")
     return ConversationHandler.END
 
 
 # ══════════════════════════════════════════
-#  /folders — 列出所有文件夹
+# 查看文件夹
 # ══════════════════════════════════════════
-
 async def cmd_folders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    owner_id = update.effective_user.id
-    rows = await db_list_folders(owner_id)
+    rows = await db_list_folders(update.effective_user.id)
     if not rows:
-        await update.message.reply_text(
-            "还没有文件夹，用 `/newfolder` 创建一个吧！",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("📂 暂无文件夹")
         return
-
-    current = context.user_data.get("current_folder")
-    lines = []
+    msg = "📋 *你的文件夹*\n\n"
     for r in rows:
-        marker = " ◀ 当前" if r["name"] == current else ""
-        lines.append(f"📁 *{r['name']}*  —  {r['video_count']} 个视频{marker}")
-
-    await update.message.reply_text(
-        "📋 *你的文件夹：*\n\n" + "\n".join(lines),
-        parse_mode="Markdown",
-    )
+        msg += f"📁 {r['name']} — {r['video_count']} 个视频\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════
-#  /open — 选择当前文件夹
+# 打开文件夹
 # ══════════════════════════════════════════
-
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    owner_id = update.effective_user.id
-    args = context.args
-
-    if not args:
-        # 没传名称 → 弹出按钮列表
-        keyboard = await build_folder_keyboard(owner_id, "open")
-        if not keyboard:
-            await update.message.reply_text(
-                "还没有文件夹，用 `/newfolder` 先创建一个。",
-                parse_mode="Markdown",
-            )
-            return
-        await update.message.reply_text("请选择要打开的文件夹：", reply_markup=keyboard)
+    uid = update.effective_user.id
+    if not context.args:
+        kb = await build_folder_keyboard(uid, "open")
+        await update.message.reply_text("📂 选择文件夹：", reply_markup=kb)
         return
-
-    name = " ".join(args)
-    folder = await db_get_folder(owner_id, name)
-    if not folder:
-        await update.message.reply_text(f"❌ 找不到文件夹 *{name}*", parse_mode="Markdown")
-        return
-
-    context.user_data["current_folder"] = name
-    await update.message.reply_text(
-        f"📂 已选择文件夹 *{name}*\n现在转发视频会自动存入这里。",
-        parse_mode="Markdown",
-    )
-
+    name = " ".join(context.args)
+    f = await db_get_folder(uid, name)
+    if f:
+        context.user_data["current_folder"] = name
+        await update.message.reply_text(f"✅ 已打开：{name}")
+    else:
+        await update.message.reply_text("❌ 不存在")
 
 async def cb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data.split(":", 1)[1]
+    q = update.callback_query
+    await q.answer()
+    name = q.data.split(":")[1]
     context.user_data["current_folder"] = name
-    await query.edit_message_text(
-        f"📂 已选择文件夹 *{name}*\n现在转发视频会自动存入这里。",
-        parse_mode="Markdown",
-    )
+    await q.edit_message_text(f"✅ 已打开：{name}")
 
 
 # ══════════════════════════════════════════
-#  /get — 取出文件夹内所有视频
+# 【新增】查看视频列表
 # ══════════════════════════════════════════
-
-async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    owner_id = update.effective_user.id
-    args = context.args
-
-    if not args:
-        keyboard = await build_folder_keyboard(owner_id, "get")
-        if not keyboard:
-            await update.message.reply_text(
-                "还没有文件夹，用 `/newfolder` 先创建一个。",
-                parse_mode="Markdown",
-            )
-            return
-        await update.message.reply_text("请选择要取出视频的文件夹：", reply_markup=keyboard)
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("用法：/list 文件夹名")
         return
+    name = " ".join(context.args)
+    f = await db_get_folder(uid, name)
+    if not f:
+        await update.message.reply_text("❌ 文件夹不存在")
+        return
+    vs = await db_get_videos(f["id"])
+    if not vs:
+        await update.message.reply_text("📂 空文件夹")
+        return
+    txt = f"📜 *{name}* 内视频：\n\n"
+    for i, v in enumerate(vs, 1):
+        txt += f"{i}. 视频 {i}\n"
+    await update.message.reply_text(txt, parse_mode="Markdown")
 
-    name = " ".join(args)
-    await send_folder_videos(update.message, owner_id, name, context)
 
+# ══════════════════════════════════════════
+# 【新增】删除单个视频
+# ══════════════════════════════════════════
+async def cmd_del_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text("用法：/delVideo 文件夹名 视频编号")
+        return
+    fname = context.args[0]
+    try:
+        idx = int(context.args[1])
+    except:
+        await update.message.reply_text("❌ 编号必须是数字")
+        return
+    f = await db_get_folder(uid, fname)
+    if not f:
+        await update.message.reply_text("❌ 文件夹不存在")
+        return
+    ok = await db_delete_video(f["id"], idx)
+    if ok:
+        await update.message.reply_text(f"🗑 已删除视频 {idx}")
+    else:
+        await update.message.reply_text("❌ 删除失败（编号错误）")
+
+
+# ══════════════════════════════════════════
+# 获取视频
+# ══════════════════════════════════════════
+async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args:
+        kb = await build_folder_keyboard(uid, "get")
+        await update.message.reply_text("📤 获取视频：", reply_markup=kb)
+        return
+    name = " ".join(context.args)
+    await send_videos(update.message, uid, name)
 
 async def cb_get_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data.split(":", 1)[1]
-    owner_id = query.from_user.id
-    await query.edit_message_text(f"📤 正在发送文件夹 *{name}* 的视频…", parse_mode="Markdown")
-    await send_folder_videos(query.message, owner_id, name, context)
+    q = update.callback_query
+    await q.answer()
+    name = q.data.split(":")[1]
+    await q.edit_message_text(f"📤 正在发送：{name}")
+    await send_videos(q.message, q.from_user.id, name)
 
-
-async def send_folder_videos(message, owner_id: int, name: str, context):
-    folder = await db_get_folder(owner_id, name)
-    if not folder:
-        await message.reply_text(f"❌ 找不到文件夹 *{name}*", parse_mode="Markdown")
+async def send_videos(msg, uid, fname):
+    f = await db_get_folder(uid, fname)
+    if not f:
+        await msg.reply_text("❌ 不存在")
         return
-
-    videos = await db_get_videos(folder["id"])
-    if not videos:
-        await message.reply_text(
-            f"📁 文件夹 *{name}* 是空的。",
-            parse_mode="Markdown",
-        )
+    vs = await db_get_videos(f["id"])
+    if not vs:
+        await msg.reply_text("📂 空文件夹")
         return
-
-    await message.reply_text(f"📤 文件夹 *{name}* 共 {len(videos)} 个视频，正在发送…", parse_mode="Markdown")
-    for v in videos:
-        source = f"\n📡 来源：{v['forward_from']}" if v.get("forward_from") else ""
-        cap = f"📁 {name}{source}\n{v['caption'] or ''}"
+    for v in vs:
         try:
-            await message.reply_video(video=v["file_id"], caption=cap.strip())
-        except Exception as e:
-            await message.reply_text(f"⚠️ 一个视频发送失败：{e}")
+            await msg.reply_video(v["file_id"], caption=f"来自：{fname}")
+        except:
+            continue
 
 
 # ══════════════════════════════════════════
-#  /rename — 重命名文件夹
+# 重命名 & 删除文件夹
 # ══════════════════════════════════════════
-
 async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("用法：`/rename 旧名称 新名称`", parse_mode="Markdown")
+        await update.message.reply_text("用法：/rename 旧名 新名")
         return
-
-    owner_id = update.effective_user.id
-    old_name = context.args[0]
-    new_name = " ".join(context.args[1:])
-    result = await db_rename_folder(owner_id, old_name, new_name)
-
-    if result == "ok":
-        if context.user_data.get("current_folder") == old_name:
-            context.user_data["current_folder"] = new_name
-        await update.message.reply_text(
-            f"✅ 已将文件夹 *{old_name}* 重命名为 *{new_name}*",
-            parse_mode="Markdown",
-        )
-    elif result == "not_found":
-        await update.message.reply_text(f"❌ 找不到文件夹 *{old_name}*", parse_mode="Markdown")
+    res = await db_rename_folder(update.effective_user.id, context.args[0], " ".join(context.args[1:]))
+    if res == "ok":
+        await update.message.reply_text("✅ 已重命名")
+    elif res == "not_found":
+        await update.message.reply_text("❌ 不存在")
     else:
-        await update.message.reply_text(f"⚠️ 文件夹 *{new_name}* 已存在，请换个名称。", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ 新名称已存在")
 
-
-# ══════════════════════════════════════════
-#  /delFolder — 删除文件夹
-# ══════════════════════════════════════════
-
-async def cmd_del_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_delFolder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("用法：`/delFolder 文件夹名称`", parse_mode="Markdown")
+        await update.message.reply_text("用法：/delFolder 名称")
         return
-
-    owner_id = update.effective_user.id
     name = " ".join(context.args)
-
-    # 二次确认
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ 确认删除", callback_data=f"delconfirm:{name}"),
-        InlineKeyboardButton("❌ 取消", callback_data="delcancel"),
-    ]])
-    await update.message.reply_text(
-        f"⚠️ 确定要删除文件夹 *{name}* 及其所有视频吗？",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
-
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 确认删除", callback_data=f"delconfirm:{name}")],
+        [InlineKeyboardButton("❌ 取消", callback_data="delcancel")]
+    ])
+    await update.message.reply_text(f"⚠️ 删除 {name}？", reply_markup=kb)
 
 async def cb_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data.split(":", 1)[1]
-    owner_id = query.from_user.id
-    ok = await db_delete_folder(owner_id, name)
-    if ok:
-        if context.user_data.get("current_folder") == name:
-            context.user_data.pop("current_folder", None)
-        await query.edit_message_text(f"🗑 文件夹 *{name}* 已删除。", parse_mode="Markdown")
-    else:
-        await query.edit_message_text(f"❌ 找不到文件夹 *{name}*", parse_mode="Markdown")
-
+    q = update.callback_query
+    await q.answer()
+    name = q.data.split(":")[1]
+    ok = await db_delete_folder(q.from_user.id, name)
+    await q.edit_message_text("🗑 已删除" if ok else "❌ 失败")
 
 async def cb_del_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("已取消删除。")
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("✅ 已取消")
 
 
 # ══════════════════════════════════════════
-#  接收视频
+# 接收视频
 # ══════════════════════════════════════════
-
 async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    video = message.video or message.document
+    msg = update.effective_message
+    video = msg.video or msg.document
     if not video:
         return
-
-    owner_id = update.effective_user.id
-    file_id   = video.file_id
-    file_name = getattr(video, "file_name", None) or ""
-    caption   = message.caption or ""
-    forward_from = get_forward_source(message)
-
-    current_folder = context.user_data.get("current_folder")
-
-    if current_folder:
-        # 已选文件夹 → 直接存入
-        folder = await db_get_folder(owner_id, current_folder)
-        if folder:
-            await db_add_video(folder["id"], file_id, file_name, caption, forward_from)
-            source_line = f"\n📡 来源：{forward_from}" if forward_from else ""
-            await message.reply_text(
-                f"✅ 已存入文件夹 *{current_folder}*{source_line}\n\n"
-                f"继续转发视频，或用 `/open` 切换文件夹。",
-                parse_mode="Markdown",
-            )
+    uid = update.effective_user.id
+    current = context.user_data.get("current_folder")
+    if current:
+        f = await db_get_folder(uid, current)
+        if f:
+            await db_add_video(f["id"], video.file_id, video.file_name or "", msg.caption or "", get_forward_source(msg))
+            await msg.reply_text(f"✅ 已存入：{current}")
             return
-        else:
-            # 文件夹已被删除，清空选择
-            context.user_data.pop("current_folder", None)
+    kb = await build_folder_keyboard(uid, "saveto")
+    context.user_data["pv"] = {"fid": video.file_id, "name": video.file_name, "cap": msg.caption, "src": get_forward_source(msg)}
+    await msg.reply_text("📂 选择保存位置：", reply_markup=kb)
 
-    # 未选文件夹 → 弹出选择列表
-    keyboard = await build_folder_keyboard(owner_id, "saveto")
-    if not keyboard:
-        await message.reply_text(
-            "还没有文件夹！先用 `/newfolder` 创建一个，再转发视频。",
-            parse_mode="Markdown",
-        )
+async def cb_save_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    name = q.data.split(":")[1]
+    pv = context.user_data.pop("pv", None)
+    if not pv:
+        await q.edit_message_text("⚠️ 超时，请重发")
         return
-
-    # 暂存视频信息等待用户选择
-    context.user_data["pending_video"] = {
-        "file_id": file_id,
-        "file_name": file_name,
-        "caption": caption,
-        "forward_from": forward_from,
-    }
-    await message.reply_text("请选择要存入的文件夹：", reply_markup=keyboard)
-
-
-async def cb_save_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    name = query.data.split(":", 1)[1]
-    owner_id = query.from_user.id
-
-    pending = context.user_data.pop("pending_video", None)
-    if not pending:
-        await query.edit_message_text("⚠️ 找不到待存视频，请重新转发。")
-        return
-
-    folder = await db_get_folder(owner_id, name)
-    if not folder:
-        await query.edit_message_text(f"❌ 找不到文件夹 *{name}*", parse_mode="Markdown")
-        return
-
-    await db_add_video(
-        folder["id"],
-        pending["file_id"],
-        pending["file_name"],
-        pending["caption"],
-        pending.get("forward_from"),
-    )
-    source_line = f"\n📡 来源：{pending['forward_from']}" if pending.get("forward_from") else ""
-    await query.edit_message_text(
-        f"✅ 已存入文件夹 *{name}*{source_line}\n\n"
-        f"💡 提示：用 `/open {name}` 选定文件夹，下次转发视频无需再选。",
-        parse_mode="Markdown",
-    )
+    f = await db_get_folder(q.from_user.id, name)
+    await db_add_video(f["id"], pv["fid"], pv["name"] or "", pv["cap"] or "", pv["src"])
+    await q.edit_message_text(f"✅ 已存入：{name}")
 
 
 # ══════════════════════════════════════════
-#  主程序
+# 启动
 # ══════════════════════════════════════════
-
 async def post_init(app):
     await init_db()
-
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # 创建文件夹对话流程
-    conv_newfolder = ConversationHandler(
+    conv = ConversationHandler(
         entry_points=[CommandHandler("newfolder", cmd_newfolder)],
-        states={
-            ASK_FOLDER_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_folder_name)
-            ],
-        },
+        states={ASK_FOLDER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_folder_name)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
-    app.add_handler(conv_newfolder)
-
-    # 命令
+    app.add_handler(conv)
     app.add_handler(CommandHandler(["start", "help"], cmd_help))
     app.add_handler(CommandHandler("folders", cmd_folders))
     app.add_handler(CommandHandler("open", cmd_open))
     app.add_handler(CommandHandler("get", cmd_get))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("delVideo", cmd_del_video))
     app.add_handler(CommandHandler("rename", cmd_rename))
-    app.add_handler(CommandHandler("delFolder", cmd_del_folder))
-
-    # 视频接收
+    app.add_handler(CommandHandler("delFolder", cmd_delFolder))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video))
 
-    # Inline 按钮回调
-    app.add_handler(CallbackQueryHandler(cb_open_folder,    pattern=r"^open:"))
-    app.add_handler(CallbackQueryHandler(cb_get_folder,     pattern=r"^get:"))
-    app.add_handler(CallbackQueryHandler(cb_save_to_folder, pattern=r"^saveto:"))
-    app.add_handler(CallbackQueryHandler(cb_del_confirm,    pattern=r"^delconfirm:"))
-    app.add_handler(CallbackQueryHandler(cb_del_cancel,     pattern=r"^delcancel$"))
+    app.add_handler(CallbackQueryHandler(cb_open_folder, pattern="^open:"))
+    app.add_handler(CallbackQueryHandler(cb_get_folder, pattern="^get:"))
+    app.add_handler(CallbackQueryHandler(cb_save_to, pattern="^saveto:"))
+    app.add_handler(CallbackQueryHandler(cb_del_confirm, pattern="^delconfirm:"))
+    app.add_handler(CallbackQueryHandler(cb_del_cancel, pattern="^delcancel$"))
 
-    logger.info("📁 文件夹视频机器人已启动")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
